@@ -7,6 +7,12 @@ library(tidyverse)
 #library(scales)
 #library(stringr)
 #library(ggpubr)
+library(modelr)
+library(lme4)
+library(lmerTest)
+
+options(na.action = na.warn)
+options(warn = -1)
 
 # Define server logic required by the app
 server <- function(input, output, session) {
@@ -75,8 +81,8 @@ server <- function(input, output, session) {
   GeneList <- reactive({
     df1 <- filedata1()
     df2 <- filedata2()
-    df1 <- df1[,"Target Name"]
-    df2 <- df2[,"Target Name"]
+    df1 <- df1[, "Target Name"]
+    df2 <- df2[, "Target Name"]
     excel_table = rbind(df1, df2)
     gene_list <- unique(excel_table$`Target Name`)
     gene_list
@@ -86,6 +92,30 @@ server <- function(input, output, session) {
   })
   observe({
     updateSelectInput(session, "gene2", choices = GeneList(), selected = " ")
+  })
+  observe({
+    updateSelectInput(session, "glm_control", choices = glm_control_list(), selected = " ")
+  })
+  observe({
+    updateSelectInput(session, "glm_fixed", choices = glm_fixed_list(), selected = " ")
+  })
+  observe({
+    updateSelectInput(session, "glm_random", choices = glm_random_list(), selected = " ")
+  })
+  glm_control_list <- reactive({
+    df1 <- metadata_table()
+    gene_list <- unique(df1$`Group`)
+    gene_list
+  })
+  glm_fixed_list <- reactive({
+    df1 <- metadata_table()
+    gene_list <- unique(names(df1))
+    gene_list
+  })
+  glm_random_list <- reactive({
+    df1 <- metadata_table()
+    gene_list <- unique(names(df1))
+    gene_list
   })
   
   # This function gets the names for the target gene and the constitutive reference
@@ -142,8 +172,8 @@ server <- function(input, output, session) {
   CtTable1 <- reactive({
     table <- CtTable()
     gene1_df <- table[table$name == Gene1(),]
-    gene1_df$value[gene1_df$Tm > my_range1_upper()] <- NA
-    gene1_df$value[gene1_df$Tm < my_range1_lower()] <- NA
+    gene1_df$value[gene1_df$Tm > my_range1_upper()] <- 40
+    gene1_df$value[gene1_df$Tm < my_range1_lower()] <- 40
     table <- gene1_df
     mean_Ct_vector <- tapply(as.numeric(table$value), table$sample, mean, na.rm=TRUE)
     tm_min_vector <- tapply(as.numeric(table$Tm), table$sample, min, na.rm = TRUE)
@@ -164,8 +194,8 @@ server <- function(input, output, session) {
   CtTable2 <- reactive({  
     table <- CtTable()
     gene2_df <- table[table$name == Gene2(),]
-    gene2_df$value[gene2_df$Tm > my_range2_upper()] <- NA
-    gene2_df$value[gene2_df$Tm < my_range2_lower()] <- NA
+    gene2_df$value[gene2_df$Tm > my_range2_upper()] <- 40
+    gene2_df$value[gene2_df$Tm < my_range2_lower()] <- 40
     table <- gene2_df
     mean_Ct_vector <- tapply(as.numeric(table$value), table$sample, mean, na.rm=TRUE)
     tm_min_vector <- tapply(as.numeric(table$Tm), table$sample, min, na.rm = TRUE)
@@ -198,7 +228,9 @@ server <- function(input, output, session) {
     deltaCT_df <- deltaCT_df %>% mutate("deltaCT" = as.numeric(deltaCT_vector))
     deltaCT_df
   })
-  # This function is used to render the Table with deltaCT values
+  
+  ##___________________________________________________________________________________________________________
+  ## This function is used to render the Table with deltaCT values
   output$deltaCT <- renderTable({
     deltaCtTable()
   },digits = -2)
@@ -208,7 +240,7 @@ server <- function(input, output, session) {
     plotInput()
   },width =  400 )
   # This function proccess and plot the data
-  plotInput <- reactive({
+  plot_table <- reactive({
     threshold = Threshold()
     threshold <- as.numeric(threshold)
     colorblind_pallete <- c("#999999", "#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00", "#CC79A7")
@@ -254,7 +286,10 @@ server <- function(input, output, session) {
     #  theme_bw(base_size=16) + theme(axis.text.x = element_text(angle=45,hjust=1), legend.title = element_blank()) +
     #  xlab("Sample") + ylab("RNA levels") +
     #  scale_colour_manual(values = ifelse( table$value > threshold, colorblind_pallete[1], colorblind_pallete[2] ) )
-    
+    table_positive
+  })
+  plotInput <- reactive({
+    table_positive <- plot_table()
     fig_1 <- ggpubr::ggboxplot(data = table_positive, x = "Sample", y = "value",
                                color = "Group", add = "jitter",
                                #shape = "Group",
@@ -274,14 +309,84 @@ server <- function(input, output, session) {
    #     #stat_compare_means()    # label.y = 50               # Add global p-value
    # }
     fig_1
-    
   })
   
-  ## This function is used to save the plot as a PDF file
+  ##_______________________________________
+  # Plotting Heatmaop
+  plot_heatmap <-  reactive({
+    table_positive <- plot_table()
+    heatmap_data <- table_positive %>% 
+      spread(Group, value) %>%
+      as.matrix()
+    
+    pheatmap::pheatmap(mat = t(heatmap_data), scale = "row",cluster_cols = input$heatmap_1_cluster,cluster_rows = input$heatmap_1_cluster, clustering_method = "ward.D2",border_color = NA)
+  })
+  
+  output$glm_stats_table <- renderTable({
+    glm_table()
+  },digits = -4)
+  
+  glm_table <- reactive({
+    #deltaCt_table <- deltaCtTable()
+    deltaCt_table <- readxl::read_excel("raw/delta_Ct_table_teste.xlsx")
+    #metadata_df <- metadata_table()
+    metadata_df <- readxl::read_excel("raw/metadata_example.xlsx")
+    if(is.null(metadata_df)){
+      return(NULL)
+    }
+    deltaCt_GLM_table <- deltaCt_table %>%
+      select(sample_ID,Sample,deltaCT) %>%
+      #spread(Sample,deltaCT) %>% 
+      left_join(metadata_df, by = c("sample_ID" = "Sample")) %>%
+      {.}
+    group_vector <- c()
+    gene_name_vector <- c()
+    pvalue_vector <- c()
+    gene_name = Gene1()
+    if( (input$glm_fixed == " ") || (input$glm_random == " ") ){
+      df_GLM <- deltaCt_GLM_table %>%
+#        dplyr::rename(gene_name = deltaCt) %>%
+        dplyr::select(deltaCT) %>%
+        {.}
+    }else{
+#    for (gene_name in colnames(deltaCt_GLM_table[,2:(ncol(deltaCt_GLM_table)-3)])){
+      df_GLM <- deltaCt_GLM_table %>%
+#        dplyr::rename(gene_name = deltaCt) %>%
+        dplyr::select("deltaCT", input$glm_fixed, input$glm_random) %>%
+        {.}
+    }
+    
+    #complete_summary <- summary(lmer(data=df_GLM, FC ~  Group + (1|plate) ))
+#      
+#      fixed_pvalue_deltaCt  <- complete_summary$coefficients[2:nrow((complete_summary)$coefficients),5]
+#      #print(fixed_pvalue_deltaCt)
+#      group_vector <- c(group_vector,names(fixed_pvalue_deltaCt))
+#      gene_name_vector <- c(gene_name_vector,rep(gene_name, times = length(fixed_pvalue_deltaCt)))
+#      pvalue_vector <- c(pvalue_vector,fixed_pvalue_deltaCt)
+#      
+#      
+#    }
+#    df_1 <- data_frame( groups = group_vector,
+#                        gene_name = gene_name_vector,
+#                        pvalue = pvalue_vector)
+#    df_1
+  })
+  
+  
+  
+  
+  
+   ## This function is used to save the plot as a PDF file
   output$download_plot_1 <- downloadHandler(
-    filename = function() { paste(input$gene1, '.pdf', sep='') },
+    filename = function() { paste(input$gene1, '_plot.pdf', sep='') },
     content = function(file) {
       ggsave(file, plot = plotInput(), device = "pdf")
+    }
+  )
+  output$download_heatmap_1 <- downloadHandler(
+    filename = function() { paste(input$gene1, '_heatmap.pdf', sep='') },
+    content = function(file) {
+      ggsave(file, plot = plot_heatmap(), device = "pdf")
     }
   )
   
@@ -293,6 +398,29 @@ server <- function(input, output, session) {
       xlsx::write.xlsx(deltaCtTable(), tempFile)
       file.rename(tempFile, file)
     })
+  ## ______________________________________________________________________
+  ## Function to download tutorial excel table
+  output$download_temp_1 <- downloadHandler(
+    filename = function() { "target_gene_data_table.xls" },
+    content = function(file) {
+      file_df <- "raw/target_gene_data.xls"
+      file.copy(file_df, file)
+    })
+  ## Function to download tutorial excel table
+  output$download_temp_2 <- downloadHandler(
+    filename = function() { "reference_gene_data_table.xls" },
+    content = function(file) {
+      file_df <- "raw/reference_gene_data.xls"
+      file.copy(file_df, file)
+    })
+  ## Function to download tutorial excel table
+  output$download_temp_3 <- downloadHandler(
+    filename = function() { "metadata_test_table.xlsx" },
+    content = function(file) {
+      file_df <- "raw/metadata_example.xlsx"
+      file.copy(file_df, file)
+    })
+  
 }
 
 server
